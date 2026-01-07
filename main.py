@@ -1,105 +1,68 @@
-from fastapi import FastAPI, WebSocket, Request
-from fastapi.responses import HTMLResponse
-import uvicorn
-import json
+from fastapi import FastAPI, HTTPException
 from datetime import datetime
+import pytz
 
 app = FastAPI()
 
-# Здесь храним данные всех подключенных телефонов
-# Структура: { "client_id": {данные...} }
-connected_devices = {}
+# --- НАСТРОЙКИ ---
+# Твой часовой пояс (важно, так как сервер Render живет по времени UTC)
+TIMEZONE = pytz.timezone('Europe/Moscow') 
 
-# --- АДМИН ПАНЕЛЬ (Визуальная часть) ---
-@app.get("/", response_class=HTMLResponse)
-async def get_dashboard(request: Request):
-    # Генерируем простую таблицу HTML
-    rows = ""
-    for client_id, data in connected_devices.items():
-        rows += f"""
-        <tr>
-            <td>{client_id}</td>
-            <td>{data.get('ip', 'Unknown')}</td>
-            <td>{data.get('limit_gb', '5.0')} GB</td>
-            <td>{data.get('battery', 0)}%</td>
-            <td>{data.get('signal', 'N/A')}</td>
-            <td>{data.get('usage_30m', 0)} MB</td>
-            <td style="color: green">Онлайн</td>
-        </tr>
-        """
-    
-    html_content = f"""
-    <html>
-        <head>
-            <title>Proxy Admin Panel</title>
-            <meta http-equiv="refresh" content="5"> <style>
-                body {{ font-family: Arial, sans-serif; padding: 20px; background: #f4f4f9; }}
-                h1 {{ color: #333; }}
-                table {{ width: 100%; border-collapse: collapse; background: white; }}
-                th, td {{ padding: 12px; border: 1px solid #ddd; text-align: left; }}
-                th {{ background-color: #4CAF50; color: white; }}
-                tr:nth-child(even) {{ background-color: #f2f2f2; }}
-            </style>
-        </head>
-        <body>
-            <h1>📱 Панель управления устройствами</h1>
-            <table>
-                <tr>
-                    <th>ID Устройства</th>
-                    <th>IP Адрес</th>
-                    <th>Лимит (Неделя)</th>
-                    <th>Батарея</th>
-                    <th>Сила Сигнала</th>
-                    <th>Расход (30 мин)</th>
-                    <th>Статус</th>
-                </tr>
-                {rows}
-            </table>
-            <p>Всего устройств онлайн: {len(connected_devices)}</p>
-        </body>
-    </html>
-    """
-    return html_content
+# Переключатель "Красная кнопка". По умолчанию True (работаем).
+# Если ты вызовешь /admin/stop, станет False (отмена смены).
+WORK_ALLOWED = True
 
-# --- ТОЧКА ВХОДА ДЛЯ ТЕЛЕФОНОВ (Техническая часть) ---
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await websocket.accept()
+def is_time_window_open():
+    """Проверяет, попадаем ли мы сейчас в рабочее время"""
+    now = datetime.now(TIMEZONE)
+    weekday = now.weekday() # 0=Пн, 1=Вт, 2=Ср, 3=Чт, 4=Пт, 5=Сб, 6=Вс
     
-    # Получаем IP адрес подключившегося
-    client_ip = websocket.client.host
-    
-    # Инициализируем данные устройства при подключении
-    connected_devices[client_id] = {
-        "ip": client_ip,
-        "limit_gb": 5.0,     # По умолчанию даем 5 ГБ
-        "battery": 0,
-        "signal": "Unknown",
-        "usage_30m": 0,
-        "socket": websocket  # Сохраняем соединение, чтобы отправлять команды
-    }
-    
-    print(f"[+] Устройство {client_id} подключилось ({client_ip})")
+    # Время в формате (Часы, Минуты)
+    current_time = (now.hour, now.minute)
 
-    try:
-        while True:
-            # Ждем JSON данные от телефона (обновление статуса)
-            data = await websocket.receive_text()
-            status_update = json.loads(data)
-            
-            # Обновляем информацию в базе
-            if client_id in connected_devices:
-                connected_devices[client_id].update({
-                    "battery": status_update.get("battery"),
-                    "signal": status_update.get("signal"),
-                    "usage_30m": status_update.get("usage")
-                })
-                
-    except Exception as e:
-        print(f"[-] Устройство {client_id} отключилось: {e}")
-        # Удаляем из списка, если отключился
-        if client_id in connected_devices:
-            del connected_devices[client_id]
+    # 1. Вторник (1) с 19:00 до 20:30
+    if weekday == 1:
+        return (19, 0) <= current_time < (20, 30)
+    
+    # 2. Пятница (4) с 19:00 до 20:30
+    if weekday == 4:
+        return (19, 0) <= current_time < (20, 30)
+    
+    # 3. Суббота (5) с 18:20 до 20:30
+    if weekday == 5:
+        return (18, 20) <= current_time < (20, 30)
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    return False
+
+@app.get("/")
+def home():
+    now = datetime.now(TIMEZONE)
+    status = "ОТКРЫТО" if is_time_window_open() and WORK_ALLOWED else "ЗАКРЫТО"
+    return {"server_time": now.strftime("%Y-%m-%d %H:%M"), "status": status, "manual_allow": WORK_ALLOWED}
+
+# --- ДЛЯ ТЕЛЕФОНОВ ---
+@app.get("/check_in")
+def check_in():
+    """Сюда стучится телефон, когда проснулся"""
+    if not WORK_ALLOWED:
+        return {"action": "ABORT", "reason": "Админ отменил смену"}
+    
+    if not is_time_window_open():
+        return {"action": "ABORT", "reason": "Вне расписания"}
+
+    return {"action": "WORK", "task": "Ожидаю прокси..."}
+
+# --- ПАНЕЛЬ УПРАВЛЕНИЯ (ДЛЯ ТЕБЯ) ---
+@app.get("/admin/stop")
+def admin_stop():
+    """Нажми, чтобы отменить работу сегодня"""
+    global WORK_ALLOWED
+    WORK_ALLOWED = False
+    return {"status": "Смена отменена. Телефоны получат отказ."}
+
+@app.get("/admin/start")
+def admin_start():
+    """Нажми, чтобы снова разрешить работу"""
+    global WORK_ALLOWED
+    WORK_ALLOWED = True
+    return {"status": "Смена разрешена."}
