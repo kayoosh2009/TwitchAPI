@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -7,14 +7,13 @@ import sqlite3
 import os
 
 # Конфигурация
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tasks.db")
 CHECK_INTERVAL = 30 * 60
 DEFAULT_REWARD = 0.10
 DEFAULT_DURATION = 30
 
 # Инициализация базы данных
 def init_db():
-    conn = sqlite3.connect('tasks.db')
+    conn = sqlite3.connect('tasks.db', check_same_thread=False)
     cursor = conn.cursor()
     
     # Таблица пользователей
@@ -71,10 +70,10 @@ def init_db():
         ''', test_tasks)
     
     conn.commit()
-    conn.close()
+    return conn
 
 # Инициализируем БД при запуске
-init_db()
+db_conn = init_db()
 
 # FastAPI приложение
 app = FastAPI(title="Task Tracker API", version="1.0.0")
@@ -120,14 +119,8 @@ class TaskCreateRequest(BaseModel):
     reward: float = DEFAULT_REWARD
 
 # Функции для работы с БД
-def get_db_connection():
-    conn = sqlite3.connect('tasks.db')
-    conn.row_factory = sqlite3.Row  # Чтобы возвращать dict-like объекты
-    return conn
-
 def get_or_create_user(device_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = db_conn.cursor()
     
     cursor.execute('SELECT * FROM users WHERE device_id = ?', (device_id,))
     user = cursor.fetchone()
@@ -137,12 +130,11 @@ def get_or_create_user(device_id: str):
             'INSERT INTO users (device_id) VALUES (?)', 
             (device_id,)
         )
-        conn.commit()
+        db_conn.commit()
         cursor.execute('SELECT * FROM users WHERE device_id = ?', (device_id,))
         user = cursor.fetchone()
     
-    conn.close()
-    return dict(user) if user else None
+    return user
 
 # Эндпоинты
 @app.get("/")
@@ -151,33 +143,30 @@ async def root():
 
 @app.get("/user/{device_id}", response_model=UserInfoResponse)
 async def get_user_info(device_id: str):
+    cursor = db_conn.cursor()
+    
     user = get_or_create_user(device_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
     
     # Считаем выполненные задания
     cursor.execute('''
         SELECT COUNT(*) FROM assignments 
         WHERE user_id = ? AND status = 'completed'
-    ''', (user['id'],))
+    ''', (user[0],))  # user[0] - это id
+    
     total_completed = cursor.fetchone()[0]
     
-    conn.close()
-    
     return UserInfoResponse(
-        device_id=user['device_id'],
-        balance=user['balance'],
+        device_id=user[1],  # user[1] - это device_id
+        balance=user[2],    # user[2] - это balance
         total_completed=total_completed,
-        created_at=user['created_at']
+        created_at=user[3]   # user[3] - это created_at
     )
 
 @app.get("/get-task/{device_id}", response_model=TaskAssignmentResponse)
 async def get_task(device_id: str):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = db_conn.cursor()
     
     # Находим или создаем пользователя
     user = get_or_create_user(device_id)
@@ -190,60 +179,56 @@ async def get_task(device_id: str):
         FROM assignments a 
         JOIN tasks t ON a.task_id = t.id 
         WHERE a.user_id = ? AND a.status = 'assigned'
-    ''', (user['id'],))
+    ''', (user[0],))
     active_assignment = cursor.fetchone()
     
     if active_assignment:
-        conn.close()
         return TaskAssignmentResponse(
-            assignment_id=active_assignment['assignment_id'],
-            title=active_assignment['title'],
-            url=active_assignment['url'],
-            description=active_assignment['description'],
-            visit_duration_sec=active_assignment['visit_duration_sec'],
-            reward=active_assignment['reward']
+            assignment_id=active_assignment[0],
+            title=active_assignment[2],
+            url=active_assignment[3],
+            description=active_assignment[4],
+            visit_duration_sec=active_assignment[5],
+            reward=active_assignment[6]
         )
     
     # Ищем новое задание (которое пользователь еще не выполнял)
     cursor.execute('''
         SELECT t.* FROM tasks t 
-        WHERE t.is_active = TRUE 
+        WHERE t.is_active = 1 
         AND t.id NOT IN (
             SELECT task_id FROM assignments 
             WHERE user_id = ? AND status = 'completed'
         )
         LIMIT 1
-    ''', (user['id'],))
+    ''', (user[0],))
     
     task = cursor.fetchone()
     
     if not task:
-        conn.close()
         raise HTTPException(status_code=404, detail="No tasks available")
     
     # Создаем назначение
     cursor.execute('''
         INSERT INTO assignments (user_id, task_id, status) 
         VALUES (?, ?, 'assigned')
-    ''', (user['id'], task['id']))
+    ''', (user[0], task[0]))
     
     assignment_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    db_conn.commit()
     
     return TaskAssignmentResponse(
         assignment_id=assignment_id,
-        title=task['title'],
-        url=task['url'],
-        description=task['description'],
-        visit_duration_sec=task['visit_duration_sec'],
-        reward=task['reward']
+        title=task[1],
+        url=task[2],
+        description=task[3],
+        visit_duration_sec=task[4],
+        reward=task[5]
     )
 
 @app.post("/complete-task", response_model=CompletionResponse)
 async def complete_task(request: CompletionRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = db_conn.cursor()
     
     # Находим пользователя
     user = get_or_create_user(request.device_id)
@@ -256,16 +241,14 @@ async def complete_task(request: CompletionRequest):
         FROM assignments a 
         JOIN tasks t ON a.task_id = t.id 
         WHERE a.id = ? AND a.user_id = ?
-    ''', (request.assignment_id, user['id']))
+    ''', (request.assignment_id, user[0]))
     
     assignment = cursor.fetchone()
     
     if not assignment:
-        conn.close()
         raise HTTPException(status_code=404, detail="Assignment not found")
     
-    if assignment['status'] == 'completed':
-        conn.close()
+    if assignment[3] == 'completed':  # assignment[3] - это status
         raise HTTPException(status_code=400, detail="Task already completed")
     
     # Обновляем статус и начисляем награду
@@ -274,23 +257,21 @@ async def complete_task(request: CompletionRequest):
         WHERE id = ?
     ''', (request.assignment_id,))
     
-    new_balance = user['balance'] + assignment['reward']
-    cursor.execute('UPDATE users SET balance = ? WHERE id = ?', (new_balance, user['id']))
+    new_balance = user[2] + assignment[7]  # user[2] - balance, assignment[7] - reward
+    cursor.execute('UPDATE users SET balance = ? WHERE id = ?', (new_balance, user[0]))
     
-    conn.commit()
-    conn.close()
+    db_conn.commit()
     
     return CompletionResponse(
         status="success",
-        reward_added=assignment['reward'],
+        reward_added=assignment[7],
         new_balance=new_balance
     )
 
 # Админские эндпоинты
 @app.post("/admin/tasks")
 async def create_task(request: TaskCreateRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = db_conn.cursor()
     
     cursor.execute('''
         INSERT INTO tasks (title, url, description, visit_duration_sec, reward) 
@@ -299,15 +280,13 @@ async def create_task(request: TaskCreateRequest):
           request.visit_duration_sec, request.reward))
     
     task_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    db_conn.commit()
     
     return {"message": "Task created", "task_id": task_id}
 
 @app.get("/admin/stats")
 async def get_stats():
-    conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = db_conn.cursor()
     
     cursor.execute('SELECT COUNT(*) FROM users')
     total_users = cursor.fetchone()[0]
@@ -320,8 +299,6 @@ async def get_stats():
     
     cursor.execute('SELECT SUM(balance) FROM users')
     total_rewards = cursor.fetchone()[0] or 0
-    
-    conn.close()
     
     return {
         "total_users": total_users,
